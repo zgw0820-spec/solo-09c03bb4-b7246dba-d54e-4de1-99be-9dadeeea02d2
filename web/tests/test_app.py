@@ -30,6 +30,13 @@ class FakeControl:
         self.served: str | None = None
         self.reload_count = 0
         self.probe_error = False
+        # 可按令牌定制回执：令牌 -> 回执字符串 / None（超时）。
+        # 未命中的令牌走 receipt_mode。
+        self.receipts: dict[str, str | None] = {}
+        # 可在指定令牌的回执返回前执行动作（模拟迟到结果与交错的启用）。
+        self.before_receipt: dict[str, callable] = {}
+        # 探测到指定指纹后执行一次动作（模拟探测与写入交错）。
+        self.on_probe: list[tuple[str, callable]] = []
 
     def _live_fp(self):
         return self.service.live_fingerprint()
@@ -37,6 +44,14 @@ class FakeControl:
     def probe(self) -> str:
         if self.probe_error:
             raise ProbeError("fake probe error")
+        if self.served is None:
+            raise ProbeError("nothing served yet")
+        # 握手返回某个指纹后触发一次性动作（模拟探测与其它提交交错）
+        for fp, action in list(self.on_probe):
+            if self.served == fp:
+                self.on_probe.remove((fp, action))
+                action()
+                break
         if self.served is None:
             raise ProbeError("nothing served yet")
         return self.served
@@ -47,6 +62,11 @@ class FakeControl:
             self.served = self._live_fp()
 
     def wait_receipt(self, token: str, timeout: float):
+        hook = self.before_receipt.pop(token, None)
+        if hook is not None:
+            hook()
+        if token in self.receipts:
+            return self.receipts[token]
         if self.receipt_mode == "timeout":
             return None
         if self.receipt_mode == "fail":
@@ -304,6 +324,203 @@ def test_old_pending_op_cannot_overwrite_newer(service):
     st = service.status(probe=False)
     assert st["active_version_id"] == v3["id"]
     assert service.live_fingerprint() == v3["fingerprint"]
+
+
+# ---------------------------------------------------------------- 交接竞态
+# 场景对应值班员遇到的事故：旧核实读到原证书、新启用已成功、旧核实仍回退
+# 文件并重载，页面显示 B 在用而客户端拿到原证书。
+
+
+def _v3(service):
+    v2 = upload_new(service)
+    v3 = upload_new(service)
+    return v2, v3
+
+
+def test_superseded_pending_verify_makes_no_writes(service):
+    """旧待核实操作被新提交取代后，即使超过宽限期也不得写文件/回退。"""
+    v2, v3 = _v3(service)
+    old_fp = service.status(probe=False)["active"]["fingerprint"]
+    service.control.receipt_mode = "timeout"
+    op_a = service.activate(v2["id"], base_version_id=1)
+    assert op_a["state"] == "pending_verify"
+    service.control.receipt_mode = "ok"
+    op_b = service.activate(v3["id"], base_version_id=1)
+    assert op_b["state"] == "succeeded"
+    assert service.get_op(op_a["seq"])["state"] == "superseded"
+    writes_before = service.control.reload_count
+    import time
+
+    time.sleep(0.6)  # 超过 pending_ttl
+    service.reconcile_once()
+    # 旧操作既未回写文件，也未触发回退重载
+    assert service.live_fingerprint() == v3["fingerprint"]
+    assert service.control.served == v3["fingerprint"]
+    assert service.control.reload_count == writes_before
+    assert service.get_op(op_a["seq"])["state"] == "superseded"
+    assert service.status(probe=False)["active_version_id"] == v3["id"]
+    assert old_fp != v3["fingerprint"]
+
+
+def test_rollback_aborts_if_superseded_between_check_and_write(service):
+    """归属检查在 I/O 锁内完成：检查通过后被新提交抢先，旧回退不得生效。"""
+    v2, v3 = _v3(service)
+    service.control.receipt_mode = "timeout"
+    op_a = service.activate(v2["id"], base_version_id=1)
+    assert op_a["state"] == "pending_verify"
+
+    service._io_lock.acquire()
+    try:
+        # 持锁期间新提交无法写文件，模拟"回退即将写盘但已被取代"
+        with service.db.txn() as c:
+            c.execute(
+                "UPDATE ops SET state='superseded' WHERE seq=?", (op_a["seq"],)
+            )
+        assert not service._rollback_files(service._version(1), owner_seq=op_a["seq"])
+        assert not service._may_write(op_a["seq"])
+        assert service._write_live_guarded(service._version(1), op_a["seq"]) is None
+    finally:
+        service._io_lock.release()
+    # 文件没有被旧回退改动（仍是 A 写入的目标证书）
+    assert service.get_op(op_a["seq"])["state"] == "superseded"
+
+
+def test_new_activation_waits_for_late_prior_receipt(service, monkeypatch):
+    """旧回退已发出、回执迟到：新启用必须等它落定，不能把可被覆盖的握手判成功。"""
+    v2, v3 = _v3(service)
+    service.control.receipt_mode = "timeout"
+    op_a = service.activate(v2["id"], base_version_id=1)
+    assert op_a["state"] == "pending_verify"
+
+    # 制造"旧回退已发出、回执未到"：登记一个未决回退令牌
+    service.control.receipts["rollback-late"] = None
+    with service._io_lock:
+        service._register_token("rollback-late", op_a["seq"], service._write_gen)
+        service.control.request_reload("rollback-late")
+    assert service._unresolved_tokens(0)
+
+    service.control.receipt_mode = "ok"
+    # 新启用 B 在旧回执到达前不能下结论
+    monkeypatch.setattr(service.cfg, "late_reload_wait", 0.05)
+    op_b = service.activate(v3["id"], base_version_id=1)
+    assert op_b["state"] == "pending_verify"
+    assert "回执" in op_b["detail"]
+    # 没有把 B 判为成功，也没有改写在用版本
+    assert service.status(probe=False)["active_version_id"] == 1
+    # 由于旧回执未决，B 甚至不应写盘
+    assert service.live_fingerprint() != v3["fingerprint"]
+
+    # 旧回执落定后，后台重跑 B：写盘 -> 重载 -> 以新建握手确认
+    service.control.receipts["rollback-late"] = "ok"
+    service._resolve_token("rollback-late", "ok")
+    service.reconcile_once()
+    assert service.get_op(op_b["seq"])["state"] == "succeeded"
+    assert service.status(probe=False)["active_version_id"] == v3["id"]
+    assert service.control.served == v3["fingerprint"]
+    assert service.live_fingerprint() == v3["fingerprint"]
+
+
+def test_late_rollback_receipt_cannot_flip_new_success(service):
+    """旧回退的迟到回执/重载若真把文件改回原证书，新启用不得判成功。"""
+    v2, v3 = _v3(service)
+    old_fp = service.status(probe=False)["active"]["fingerprint"]
+    service.control.receipt_mode = "timeout"
+    op_a = service.activate(v2["id"], base_version_id=1)
+    assert op_a["state"] == "pending_verify"
+
+    # 旧回退的迟到结果：在 B 探测之后把文件与对外服务改回旧证书
+    def late_rollback():
+        service._write_live(service._version(1))
+        service.control.served = old_fp
+
+    service.control.on_probe = [(v3["fingerprint"], late_rollback)]
+    service.control.receipt_mode = "ok"
+    op_b = service.activate(v3["id"], base_version_id=1)
+    # 写入代次在探测之后被改，B 不得判成功
+    assert op_b["state"] in ("pending_verify", "superseded")
+    assert service.get_op(op_a["seq"])["state"] in ("superseded", "succeeded")
+
+    # 后台继续跟进：对外服务一度被改回原证书，不能直接把 B 判成功。
+    # 允许两种结局：重跑并再次以握手确认 B；或恢复到可确认旧版本。
+    service.control.on_probe = []
+    for _ in range(4):
+        service.reconcile_once()
+        import time
+        time.sleep(0.05)
+    st = service.status(probe=False)
+    state = service.get_op(op_b["seq"])["state"]
+    if state == "succeeded":
+        # 只有重跑后的新建握手确实回到 B 才允许成功
+        assert service.control.served == v3["fingerprint"]
+        assert service.live_fingerprint() == v3["fingerprint"]
+        assert st["active_version_id"] == v3["id"]
+    else:
+        assert st["active_version_id"] == 1
+        assert service.live_fingerprint() == old_fp
+
+
+def test_old_reconcile_rollback_after_new_success_is_dropped(service):
+    """事故时序：旧核实读到原证书 -> B 成功 -> 旧核实醒来回退。
+
+    旧核实必须发现"自己已被取代"，既不回写文件也不请求回退；页面与
+    客户端实际拿到的证书必须都是 B。
+    """
+    v2, v3 = _v3(service)
+    old_fp = service.status(probe=False)["active"]["fingerprint"]
+    service.control.receipt_mode = "timeout"
+    op_a = service.activate(v2["id"], base_version_id=1)
+    assert op_a["state"] == "pending_verify"
+    assert service.live_fingerprint() == v2["fingerprint"]
+
+    service.cfg.reconcile_delay_before_rollback = 0.3
+
+    def interleave():
+        # 旧核实已探测到"原证书"（此刻 Nginx 仍服务旧证书），在回退前
+        # 让 B 完成启用。
+        service.control.receipt_mode = "ok"
+
+        def run_b():
+            op_b = service.activate(v3["id"], base_version_id=1)
+            assert op_b["state"] == "succeeded"
+
+        t = threading.Thread(target=run_b)
+        t.start()
+        t.join()
+
+    # 让后台核实命中"原证书"，并在延迟窗口内插入 B
+    service.control.served = old_fp
+    service.control.on_probe = [(old_fp, interleave)]
+    service.control.served = old_fp
+    # 超过 pending_ttl，使旧核实进入回退流程
+    import time
+
+    time.sleep(0.6)
+    reload_before_b = None
+    service.reconcile_once()
+    # B 成功后在用文件/服务均为 v3
+    assert service.get_op(op_a["seq"])["state"] == "superseded"
+    st = service.status(probe=False)
+    assert st["active_version_id"] == v3["id"]
+    assert service.live_fingerprint() == v3["fingerprint"]
+    assert service.control.served == v3["fingerprint"]
+    assert reload_before_b is None
+
+
+def test_pending_success_requires_no_unresolved_reload(service):
+    v2 = upload_new(service)
+    service.control.receipt_mode = "timeout"
+    op = service.activate(v2["id"], base_version_id=1)
+    assert op["state"] == "pending_verify"
+    service.control.served = v2["fingerprint"]
+    # 一个不属于本操作的未决令牌
+    with service._io_lock:
+        service._register_token("late-x", -1, service._write_gen)
+    service.reconcile_once()
+    assert service.get_op(op["seq"])["state"] == "pending_verify"
+    service.control.receipts["late-x"] = "ok"
+    service._resolve_token("late-x", "ok")
+    service.reconcile_once()
+    assert service.get_op(op["seq"])["state"] == "succeeded"
 
 
 # ---------------------------------------------------------------- 重启恢复

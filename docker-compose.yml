@@ -8,6 +8,11 @@ services:
       RELOAD_DIR: /reload
       NGINX_PROBE_HOST: nginx
       NGINX_PROBE_PORT: "443"
+      RECEIPT_TIMEOUT: "6"
+      VERIFY_TIMEOUT: "10"
+      PENDING_TTL: "45"
+      LATE_RELOAD_WAIT: "3"
+      STALE_RELOAD_AGE: "15"
     volumes:
       - webdata:/data
       - certs:/certs
@@ -15,6 +20,8 @@ services:
     ports:
       - "8080:8000"     # 管理页
     depends_on:
+      # 仅要求 nginx 容器已启动：watcher 会等待 web 首次生成证书文件后再启动
+      # nginx，若改成等待 healthcheck 会与这一等待互相死锁。
       - nginx
 
   nginx:

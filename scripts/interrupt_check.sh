@@ -3,6 +3,8 @@
 #  A. 启用中途（已写文件、未请求重载）kill -9 web -> 重启后应回退到可确认旧版本
 #  B. 启用中途（已请求重载）kill -9 web       -> 重启后应核实新证书已生效
 #  C. live 文件被带外篡改后重启 web           -> 应恢复为在用版本并重载
+#  D. 启用回执超时待核实期间 kill -9 web，重启时旧回退仍可能迟到
+#     -> 不得把可能被覆盖的握手判成功；最终页面/文件/握手一致
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -12,7 +14,7 @@ STACK="bash $ROOT/scripts/local_stack.sh"
 PASS=0; FAIL=0
 
 ok()  { PASS=$((PASS+1)); echo "PASS  $1"; }
-bad() { FAIL=$((FAIL+1)); echo "FAIL  $1 $2"; }
+bad() { FAIL=$((FAIL+1)); echo "FAIL  $1 ${2:-}"; }
 
 jqv() { python3 -c "import json,sys;d=json.load(sys.stdin);print($1)"; }
 live_fp() { openssl x509 -in "$WORK/live/fullchain.pem" -fingerprint -sha256 -noout 2>/dev/null | cut -d= -f2 | tr -d ':' | tr 'A-F' 'a-f'; }
@@ -73,6 +75,55 @@ $STACK restart-web >/dev/null
 sleep 2
 [ "$(live_fp)" = "$V3FP" ] && ok "C: live 文件已恢复为在用版本" || bad "C: live 文件未恢复"
 [ "$(served_fp)" = "$V3FP" ] && ok "C: 实测指纹恢复为在用版本" || bad "C: 实测指纹" "served=$(served_fp)"
+
+echo "=== 场景 D：待核实期间崩溃，重启时旧回退未落定 ==="
+# 冻结 watcher，使新启用的重载回执超时 -> 待核实
+mkcert /tmp/ic-d; V5=$(upload /tmp/ic-d)
+V5FP=$(openssl x509 -in /tmp/ic-d/chain.pem -fingerprint -sha256 -noout | cut -d= -f2 | tr -d ':' | tr 'A-F' 'a-f')
+WPID=$(cat $WORK/run/watcher.pid)
+kill -STOP "$WPID"
+CPID=$(activate_async "$V5" "$V3")
+for i in $(seq 1 400); do
+  [ -s /tmp/act_result.json ] && break
+  sleep 0.1
+done
+OPSTATE=$(jqv "d['op']['state']" < /tmp/act_result.json)
+[ "$OPSTATE" = "pending_verify" ] && ok "D: 回执不明进入待核实" || bad "D: 操作状态" "state=$OPSTATE"
+# watcher 仍冻结：Nginx 继续服务旧证书，旧核实将进入回退分支
+REQ0=$(wc -l < $WORK/reload/REQUEST)
+# 把待核实操作的创建时间提前，让后台核实立即按超时处理
+python3 - "$WORK/data/certops.db" <<'PY'
+import sqlite3, sys, datetime as dt
+c = sqlite3.connect(sys.argv[1])
+old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=600)).isoformat(timespec="seconds")
+c.execute("UPDATE ops SET created_at=? WHERE state='pending_verify'", (old,))
+c.commit(); c.close()
+PY
+for i in $(seq 1 200); do
+  L=$(wc -l < $WORK/reload/REQUEST)
+  [ "$L" -gt "$REQ0" ] && break
+  sleep 0.1
+done
+ROLLBACK_SEEN=0
+awk -v n="$REQ0" 'NR>n && $1 ~ /^rollback-/' $WORK/reload/REQUEST | grep -q . && ROLLBACK_SEEN=1
+[ "$ROLLBACK_SEEN" = "1" ] && ok "D: 旧核实已发出回退（回执未到）" || bad "D: 未观察到回退"
+# 回退请求已发出但未被处理。此时 kill -9 web（进程内未决令牌丢失），
+# 再恢复 watcher 让它执行积压的回退；重启后的 web 必须接管该回退，
+# 不得把随即被改回旧证书的握手判成功。
+$STACK kill-web >/dev/null
+kill -CONT "$WPID"
+$STACK restart-web >/dev/null || { echo "restart failed"; exit 1; }
+sleep 3
+ST=$(curl -s $WEB/api/status)
+ACTIVE=$(echo "$ST" | jqv "d['active_version_id']")
+CONS=$(echo "$ST" | jqv "d['consistency']")
+SERVED=$(served_fp)
+ACTIVEFP=$(echo "$ST" | jqv "next(v['fingerprint'] for v in d['versions'] if v['id']==d['active_version_id'])")
+[ "$SERVED" = "$ACTIVEFP" ] && ok "D: 重启后页面在用 = 实际握手" || bad "D: 页面与握手不一致" "served=$SERVED active=$ACTIVEFP"
+[ "$(live_fp)" = "$ACTIVEFP" ] && ok "D: live 文件 = 页面在用版本" || bad "D: live 文件不一致"
+[ "$ACTIVE" != "$V5" ] && ok "D: 未把可能被覆盖的握手判为成功（在用 #$ACTIVE）" \
+  || bad "D: 误判成功" "active=$V5"
+[ "$CONS" = "match" ] && ok "D: 一致性 match" || bad "D: 一致性" "cons=$CONS"
 
 echo ""
 echo "== interrupt: $PASS passed, $FAIL failed =="
